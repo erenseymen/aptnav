@@ -1,0 +1,41 @@
+[package]
+name = "aptnav"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "A repository-centric TUI for browsing and managing APT repositories and their packages"
+authors = ["Eren Seymen"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/erenseymen/aptnav"
+keywords = ["apt", "debian", "ubuntu", "tui", "packages"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+memmap2 = "0.9"
+memchr = "2.7"
+rayon = "1.10"
+nucleo-matcher = "0.3"
+anyhow = "1.0"
+dirs = "5.0"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[package.metadata.deb]
+maintainer = "Eren Seymen"
+depends = "$auto, apt"
+section = "admin"
+priority = "optional"
+assets = [
+    ["target/release/aptnav", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/aptnav/README", "644"],
+]
