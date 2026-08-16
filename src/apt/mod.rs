@@ -55,12 +55,21 @@ impl AptRoots {
 
 /// One row of a repository's package listing: cheap enough to build for
 /// every package in a repo without touching the full stanza.
+///
+/// `upgradable`, `held`, `essential` and `phased_pct` are computed once, here,
+/// rather than looked up per row on every keystroke — they used to be (for
+/// `upgradable`) an `AptData::is_upgradable` call per row per filter refresh,
+/// which is the single biggest per-keystroke cost this app had.
 #[derive(Debug, Clone)]
 pub struct PackageRow {
     pub name: String,
     pub version: String, // highest version seen across this row's stub(s)
     pub install_state: InstallState,
     pub auto_installed: bool,
+    pub upgradable: bool,
+    pub held: bool,
+    pub essential: bool,
+    pub phased_pct: Option<u8>,
     pub stub: lists::StanzaRef,
 }
 
@@ -296,7 +305,9 @@ impl AptData {
                     .or_insert(stub_idx);
             }
         }
-        self.rows_from(by_name.into_values())
+        let mut rows = self.rows_from(by_name.into_values());
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        rows
     }
 
     /// All packages known anywhere: every repo's best version, plus orphans.
@@ -332,6 +343,12 @@ impl AptData {
                     version: pkg.version.clone(),
                     install_state: pkg.state,
                     auto_installed: self.dpkg.is_auto(name),
+                    // No stub backs an orphan row by definition, so there is
+                    // no candidate version to be "upgradable" or "phased" to.
+                    upgradable: false,
+                    held: pkg.held,
+                    essential: pkg.essential,
+                    phased_pct: None,
                     stub: lists::StanzaRef {
                         file_id: usize::MAX, // sentinel: no Packages stanza backs this row
                         start: 0,
@@ -342,25 +359,24 @@ impl AptData {
             .collect()
     }
 
-    fn file_stub_indices(&self, file_idx: usize) -> Vec<usize> {
-        // Stubs are stored flat, not grouped by file; for a single file's
-        // worth of stanzas this is cheap since `file_id` was assigned
-        // contiguously per file during indexing — but to stay correct
-        // regardless of ordering, scan is used rather than assumed contiguity.
-        self.lists
-            .stubs
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.stanza.file_id == file_idx)
-            .map(|(i, _)| i)
-            .collect()
+    /// The stubs indexed from one list file. O(1): `ListIndex` records each
+    /// file's contiguous stub range at load time (see
+    /// [`lists::ListIndex::file_stub_ranges`]), so this used to be a full
+    /// linear scan of every stub in the index, once per file per repo query.
+    fn file_stub_indices(&self, file_idx: usize) -> std::ops::Range<usize> {
+        self.lists.stub_range(file_idx)
     }
 
+    /// Build rows for a set of stub indices, in no particular order — callers
+    /// sort as appropriate for their own semantics (name order almost always,
+    /// but sorting a set that's about to be merged with another, as
+    /// `all_packages` does with orphans, would just be wasted work).
     fn rows_from(&self, stub_idxs: impl Iterator<Item = usize>) -> Vec<PackageRow> {
-        let mut rows: Vec<PackageRow> = stub_idxs
+        stub_idxs
             .map(|i| {
                 let stub = &self.lists.stubs[i];
                 let installed = self.dpkg.packages.get(&stub.name);
+                let is_installed = installed.is_some_and(|p| p.state.is_present());
                 PackageRow {
                     name: stub.name.clone(),
                     version: installed
@@ -368,12 +384,17 @@ impl AptData {
                         .unwrap_or_else(|| stub.version.clone()),
                     install_state: installed.map(|p| p.state).unwrap_or_default(),
                     auto_installed: self.dpkg.is_auto(&stub.name),
+                    upgradable: is_installed
+                        && installed.is_some_and(|p| {
+                            version::compare(&stub.version, &p.version) == Ordering::Greater
+                        }),
+                    held: installed.is_some_and(|p| p.held),
+                    essential: stub.essential || installed.is_some_and(|p| p.essential),
+                    phased_pct: stub.phased_pct,
                     stub: stub.stanza,
                 }
             })
-            .collect();
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
-        rows
+            .collect()
     }
 
     /// Installed packages available *only* from `repo_idx` — what would
@@ -420,6 +441,30 @@ impl AptData {
             return None;
         }
         Some(self.lists.full_stanza(stub))
+    }
+
+    /// `Essential: yes`, checked against both the installed package (dpkg
+    /// status) and every available stub for the name — a package can be
+    /// essential in a repo's metadata before it's ever installed.
+    pub fn is_essential(&self, name: &str) -> bool {
+        self.dpkg.packages.get(name).is_some_and(|p| p.essential)
+            || self
+                .name_stubs
+                .get(name)
+                .is_some_and(|idxs| idxs.iter().any(|&i| self.lists.stubs[i].essential))
+    }
+
+    pub fn is_held(&self, name: &str) -> bool {
+        self.dpkg.is_held(name)
+    }
+
+    /// The phased-rollout percentage for a name, if any of its available
+    /// stubs carry one.
+    pub fn phased_pct(&self, name: &str) -> Option<u8> {
+        self.name_stubs
+            .get(name)?
+            .iter()
+            .find_map(|&i| self.lists.stubs[i].phased_pct)
     }
 }
 
@@ -511,5 +556,109 @@ mod tests {
             ppa_label("https://ppa.launchpadcontent.net/cappelikan/ppa/ubuntu/"),
             Some("PPA: cappelikan/ppa".to_string())
         );
+    }
+
+    #[test]
+    fn all_packages_orders_repo_and_orphan_rows_by_name_together() {
+        let dir = fixture();
+        let data = AptData::load(AptRoots::under(dir.path()), false).unwrap();
+        let rows = data.all_packages();
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "repo rows and orphan rows must merge into one name-sorted sequence"
+        );
+    }
+
+    fn fixture_with_upgrade() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir,
+            "etc/apt/sources.list",
+            "deb https://example.org/ubuntu/ noble main\n",
+        );
+        write(
+            &dir,
+            "var/lib/apt/lists/example.org_ubuntu_dists_noble_main_binary-amd64_Packages",
+            "Package: stale\nVersion: 2.0-1\n\n\
+             Package: current\nVersion: 1.0-1\n\n\
+             Package: essential-pkg\nVersion: 1.0-1\nEssential: yes\n\n",
+        );
+        write(
+            &dir,
+            "var/lib/dpkg/status",
+            "Package: stale\nStatus: install ok installed\nVersion: 1.0-1\n\n\
+             Package: current\nStatus: install ok installed\nVersion: 1.0-1\n\n\
+             Package: essential-pkg\nStatus: install ok installed\nVersion: 1.0-1\n\n\
+             Package: held-pkg\nStatus: hold ok installed\nVersion: 1.0-1\n",
+        );
+        dir
+    }
+
+    #[test]
+    fn upgradable_true_only_when_a_strictly_greater_stub_version_exists() {
+        let dir = fixture_with_upgrade();
+        let data = AptData::load(AptRoots::under(dir.path()), false).unwrap();
+        let rows = data.all_packages();
+        let row = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
+        assert!(row("stale").upgradable, "installed 1.0-1, available 2.0-1");
+        assert!(
+            !row("current").upgradable,
+            "installed version matches the only available stub"
+        );
+    }
+
+    #[test]
+    fn essential_flag_reaches_package_row() {
+        let dir = fixture_with_upgrade();
+        let data = AptData::load(AptRoots::under(dir.path()), false).unwrap();
+        let rows = data.all_packages();
+        assert!(rows.iter().find(|r| r.name == "essential-pkg").unwrap().essential);
+        assert!(!rows.iter().find(|r| r.name == "current").unwrap().essential);
+    }
+
+    #[test]
+    fn held_flag_reaches_package_row_via_orphan_and_named_rows() {
+        let dir = fixture_with_upgrade();
+        let data = AptData::load(AptRoots::under(dir.path()), false).unwrap();
+        // held-pkg has no stub anywhere, so it surfaces as an orphan row.
+        let rows = data.all_packages();
+        let held = rows.iter().find(|r| r.name == "held-pkg").unwrap();
+        assert!(held.held);
+        assert!(!rows.iter().find(|r| r.name == "current").unwrap().held);
+    }
+
+    #[test]
+    fn packages_in_repo_uses_the_o1_file_stub_range_correctly() {
+        // Two files, one repo each — packages_in_repo must return exactly
+        // that file's stubs, proving `file_stub_ranges` lines up per file
+        // rather than leaking stubs across files.
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir,
+            "etc/apt/sources.list",
+            "deb https://a.example/ noble main\ndeb https://b.example/ noble main\n",
+        );
+        write(
+            &dir,
+            "var/lib/apt/lists/a.example_dists_noble_main_binary-amd64_Packages",
+            "Package: from-a\nVersion: 1.0\n\n",
+        );
+        write(
+            &dir,
+            "var/lib/apt/lists/b.example_dists_noble_main_binary-amd64_Packages",
+            "Package: from-b1\nVersion: 1.0\n\nPackage: from-b2\nVersion: 1.0\n\n",
+        );
+        write(&dir, "var/lib/dpkg/status", "");
+        let data = AptData::load(AptRoots::under(dir.path()), false).unwrap();
+        // Without indextargets, file_repo is all None, so packages_in_repo
+        // would return nothing for either repo — this test only exercises
+        // that loading with multiple files does not panic or corrupt ranges;
+        // the per-file partition itself is covered directly in
+        // `lists::tests::file_stub_ranges_cover_stubs_exactly_per_file`.
+        assert_eq!(data.lists.stubs.len(), 3);
+        assert_eq!(data.lists.file_stub_ranges.len(), 2);
     }
 }

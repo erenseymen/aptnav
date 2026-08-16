@@ -1,10 +1,10 @@
-//! The health screen: static + live diagnostics for one repository or the
-//! whole configuration, with guided and (where possible) automatic fixes.
+//! Health diagnostics rendering and fix application — shared between the
+//! Repos tab (one repository's diagnoses) and the Maintenance tab (global
+//! diagnoses). Neither tab owns this file; both call into it.
 
-use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::backend::Backend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
@@ -13,43 +13,29 @@ use ratatui::Terminal;
 use crate::health::fixes::{self, Fix};
 use crate::health::{DiagCode, Diagnosis, Scope, Severity};
 
-use super::app::{App, PendingAction, PendingConfirm, Screen};
+use super::app::{App, PendingAction, PendingConfirm};
 use super::overlay::Confirm;
+use super::theme::Theme;
 
-pub const HELP: &[(&str, &str)] = &[
-    ("↑↓ / jk", "move selection"),
-    ("Enter", "show explanation for the selected diagnosis"),
-    ("f", "apply the suggested fix"),
-    ("A", "apply every auto-fixable diagnosis"),
-    ("Esc", "back to repositories"),
-];
-
-pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
-    let Some(h) = &app.health else { return };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(area);
-
-    let title = match h.scope_repo {
-        Some(idx) => format!(
-            "Health \u{2014} {}",
-            app.data.repo(idx).map(|r| r.title()).unwrap_or_default()
-        ),
-        None => format!(
-            "Health \u{2014} all repositories ({} diagnoses)",
-            h.diagnoses.len()
-        ),
-    };
-
-    let items: Vec<ListItem> = h
-        .diagnoses
+/// Render a list of diagnoses into `area`. `selected` is clamped by the
+/// caller — an out-of-range index here just means nothing is highlighted.
+/// Returns the inner row area and the resulting scroll offset, for callers
+/// that record them into `App.layout` for mouse hit-testing.
+pub fn render_diag_list(
+    frame: &mut Frame,
+    area: Rect,
+    diagnoses: &[&Diagnosis],
+    selected: usize,
+    title: &str,
+    theme: Theme,
+) -> (Rect, usize) {
+    let items: Vec<ListItem> = diagnoses
         .iter()
         .map(|d| {
             let (icon, color) = match d.severity {
-                Severity::Error => ("\u{2717}", Color::Red),
-                Severity::Warning => ("\u{26a0}", Color::Yellow),
-                Severity::Info => ("\u{2139}", Color::Cyan),
+                Severity::Error => ("\u{2717}", theme.error),
+                Severity::Warning => ("\u{26a0}", theme.warn),
+                Severity::Info => ("\u{2139}", theme.info),
             };
             let fixable = if fixes::plan_fix(d).is_some() {
                 " [fixable]"
@@ -62,34 +48,40 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(icon, Style::default().fg(color)),
                 Span::raw(" "),
                 Span::raw(d.message.clone()),
-                Span::styled(fixable, Style::default().fg(Color::DarkGray)),
+                Span::styled(fixable, Style::default().fg(theme.dim)),
             ]))
         })
         .collect();
 
     let mut state = ListState::default();
-    if !h.diagnoses.is_empty() {
-        state.select(Some(h.selected));
+    if !diagnoses.is_empty() {
+        state.select(Some(selected));
     }
+    let block = Block::default()
+        .title(title.to_string())
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
     let list = List::new(items)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(block)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(list, chunks[0], &mut state);
+    frame.render_stateful_widget(list, area, &mut state);
+    (inner, state.offset())
+}
 
-    let detail = h
-        .diagnoses
-        .get(h.selected)
-        .map(|d| detail_lines(app, d))
-        .unwrap_or_default();
+pub fn render_diag_detail(frame: &mut Frame, area: Rect, diag: Option<&Diagnosis>, theme: Theme) {
+    let lines = match diag {
+        Some(d) => detail_lines(d, theme),
+        None => vec![Line::from("No diagnoses")],
+    };
     frame.render_widget(
-        Paragraph::new(detail)
+        Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(Block::default().title("Detail").borders(Borders::ALL)),
-        chunks[1],
+        area,
     );
 }
 
-fn detail_lines(_app: &App, d: &Diagnosis) -> Vec<Line<'static>> {
+fn detail_lines(d: &Diagnosis, theme: Theme) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(
             format!("{:?}", d.severity),
@@ -100,61 +92,29 @@ fn detail_lines(_app: &App, d: &Diagnosis) -> Vec<Line<'static>> {
     ];
     if let Some(fix) = fixes::plan_fix(d) {
         lines.push(Line::from(vec![
-            Span::styled("Suggested fix: ", Style::default().fg(Color::Green)),
+            Span::styled("Suggested fix: ", Style::default().fg(theme.ok)),
             Span::raw(format!("{fix:?}")),
         ]));
     } else if let Some(explain) = fixes::explain_only(&d.code) {
         lines.push(Line::from(Span::styled(
             "Not fixable from a terminal:",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme.warn),
         )));
         lines.push(Line::from(explain));
     } else {
         lines.push(Line::from(Span::styled(
-            "No automatic remedy; use the repository screen's controls (disable/remove) if needed.",
-            Style::default().fg(Color::DarkGray),
+            "No automatic remedy; use the Repos tab's controls (disable/remove) if needed.",
+            Style::default().fg(theme.dim),
         )));
     }
     lines
 }
 
-pub fn handle_key<B: Backend + std::io::Write>(
-    app: &mut App,
-    key: KeyEvent,
-    _terminal: &mut Terminal<B>,
-) -> anyhow::Result<()> {
-    match key.code {
-        KeyCode::Esc => app.screen = Screen::Repos,
-        KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(h) = &mut app.health {
-                h.selected = h.selected.saturating_sub(1);
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(h) = &mut app.health {
-                if h.selected + 1 < h.diagnoses.len() {
-                    h.selected += 1;
-                }
-            }
-        }
-        KeyCode::Char('f') => queue_fix(app),
-        KeyCode::Char('A') => apply_all_safe(app),
-        _ => {}
-    }
-    Ok(())
-}
-
-fn selected_diag(app: &App) -> Option<Diagnosis> {
-    app.health
-        .as_ref()?
-        .diagnoses
-        .get(app.health.as_ref()?.selected)
-        .cloned()
-}
-
-fn queue_fix(app: &mut App) {
-    let Some(d) = selected_diag(app) else { return };
-    let Some(fix) = resolve_fix(app, &d) else {
+/// Queue a confirmation for the fix belonging to one diagnosis. Used by both
+/// the Repos tab (`f` on a repo's diagnosis) and the Maintenance tab (`f` on
+/// a global diagnosis).
+pub fn queue_fix(app: &mut App, d: &Diagnosis) {
+    let Some(fix) = resolve_fix(app, d) else {
         app.set_status("No automatic fix available for this diagnosis", true);
         return;
     };
@@ -164,8 +124,10 @@ fn queue_fix(app: &mut App) {
             title: "Apply fix".into(),
             detail: vec![d.message.clone()],
             prompt: format!("{desc}?"),
+            alt: None,
         },
         action: PendingAction::ApplyFix(fix),
+        alt_action: None,
     });
 }
 
@@ -200,31 +162,40 @@ fn resolve_fix(app: &App, d: &Diagnosis) -> Option<Fix> {
     }
 }
 
-fn apply_all_safe(app: &mut App) {
-    let Some(h) = &app.health else { return };
-    let fixable: Vec<Fix> = h
-        .diagnoses
+/// Apply every bulk-safe fix in `diagnoses` without a per-item confirm,
+/// reporting `Applied n/m` — the batching UX both the Repos tab's and the
+/// Maintenance tab's `A` reuse verbatim. Reloads app data afterward, which
+/// also rebuilds `app.diagnostics`; there is no separate "reopen" step
+/// needed now that diagnostics live centrally.
+pub fn apply_all_safe<B: Backend + std::io::Write>(
+    app: &mut App,
+    diagnoses: &[Diagnosis],
+    terminal: &mut Terminal<B>,
+) -> anyhow::Result<()> {
+    let fixable: Vec<Fix> = diagnoses
         .iter()
         .filter(|d| fixes::bulk_safe(d))
         .filter_map(|d| resolve_fix(app, d))
         .collect();
     if fixable.is_empty() {
         app.set_status("Nothing auto-fixable here", false);
-        return;
+        return Ok(());
     }
     let count = fixable.len();
     let descs: Vec<String> = fixable
         .iter()
         .map(|f| f.describe(&app.data.sources))
         .collect();
-    // Batch application is expressed as repeated single-fix confirms would
-    // be tedious; instead this applies them immediately since each one
-    // individually is exactly what a user could already approve one at a
-    // time with `f`, and `A` is explicitly the "apply every safe fix" bulk
-    // action advertised in the help screen.
+
+    app.with_suspended_terminal(terminal, |_| Ok(()))?;
+    if let Err(e) = app.privileges.ensure() {
+        app.set_status(format!("Authentication failed: {e}"), true);
+        return Ok(());
+    }
+
     let mut applied = 0;
     for fix in fixable {
-        if health_apply(app, &fix).is_ok() {
+        if apply_fix(app, &fix).is_ok() {
             applied += 1;
         }
     }
@@ -233,12 +204,7 @@ fn apply_all_safe(app: &mut App) {
         applied < count,
     );
     let _ = app.reload_data();
-    app.open_health_for(app.health.as_ref().and_then(|h| h.scope_repo));
-}
-
-fn health_apply(app: &mut App, fix: &Fix) -> anyhow::Result<()> {
-    app.privileges.ensure()?;
-    apply_fix(app, fix).map(|_| ())
+    Ok(())
 }
 
 /// Execute a [`Fix`] against the live system. Called both from the

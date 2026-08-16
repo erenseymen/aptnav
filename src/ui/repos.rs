@@ -1,13 +1,14 @@
-//! The repository list screen: the app's entry point. Shows "All packages",
-//! "Not from any repository", then every configured repository, with
-//! keyboard shortcuts to manage them.
+//! The Repos tab: repository list plus each repository's health diagnoses
+//! side by side (`List` mode), or one repository's packages drilled into
+//! inline (`Drill` mode, which reuses the Packages tab's own rendering and
+//! key handling — see [`super::packages`]).
 
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
@@ -15,28 +16,77 @@ use ratatui::Terminal;
 
 use crate::actions::edit;
 use crate::health::fixes::Fix;
+use crate::health::{Diagnosis, Severity};
 
-use super::app::{App, PackageContext, PendingAction, PendingConfirm, PendingPrompt, RepoRow};
+use super::app::{
+    App, PackageContext, PendingAction, PendingConfirm, PendingPrompt, RepoRow, ReposFocus,
+    ReposMode,
+};
 use super::overlay::{Confirm, Prompt};
 
 pub const HELP: &[(&str, &str)] = &[
-    ("↑↓ / jk", "move selection"),
-    ("Enter", "open packages for the selected repository"),
+    ("↑↓ / jk", "move selection in the focused pane"),
+    ("←→ / hl", "switch focus: repo list ↔ diagnostics"),
+    ("Enter", "drill into the selected repository's packages"),
     ("/", "filter repositories"),
     ("Space", "toggle enabled/disabled"),
     ("a", "add a repository (URL or ppa:user/name)"),
     ("x", "remove a repository's source entry"),
     ("e", "edit the source file in $EDITOR"),
-    ("u", "run apt update"),
-    ("h", "show health diagnostics for the selected repository"),
     ("m", "migrate a legacy .list entry to deb822 .sources"),
-    ("i", "show removal impact (installed packages only here)"),
+    ("d", "show removal impact (installed packages only here)"),
+    ("f", "apply the selected diagnosis's fix"),
+    ("A", "apply every auto-fixable diagnosis for this repo"),
+    ("u", "run apt update (global; works from any tab)"),
     ("?", "toggle this help"),
     ("q", "quit"),
 ];
 
-pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = if app.repos.filter_active || !app.repos.filter_text.is_empty() {
+pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+    match app.repos.mode {
+        ReposMode::Drill => super::packages::draw(frame, app, area),
+        ReposMode::List => draw_list_mode(frame, app, area),
+    }
+}
+
+fn draw_list_mode(frame: &mut Frame, app: &mut App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
+    draw_repo_list(frame, app, cols[0]);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(cols[1]);
+
+    let repo_idx = selected_repo_idx(app);
+    let diags: Vec<&Diagnosis> = match repo_idx {
+        Some(idx) => app.diagnostics.for_repo(idx).collect(),
+        None => Vec::new(),
+    };
+    let title = match repo_idx {
+        Some(idx) => format!(
+            "Diagnostics \u{2014} {}",
+            app.data.repo(idx).map(|r| r.title()).unwrap_or_default()
+        ),
+        None => "Diagnostics".to_string(),
+    };
+    let selected = app
+        .repos
+        .diag_selected
+        .min(diags.len().saturating_sub(1));
+    let (diag_rows, diag_offset) =
+        super::health::render_diag_list(frame, rows[0], &diags, selected, &title, app.theme);
+    super::health::render_diag_detail(frame, rows[1], diags.get(selected).copied(), app.theme);
+    app.layout.diag_rows = diag_rows;
+    app.layout.diag_row_offset = diag_offset;
+}
+
+fn draw_repo_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    let chunks = if app.repos.list.filter_active || !app.repos.list.filter_text.is_empty() {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(3)])
@@ -49,22 +99,19 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut idx = 0;
     if chunks.len() == 2 {
-        let filter_line = Paragraph::new(format!("/{}", app.repos.filter_text));
+        let filter_line = Paragraph::new(format!("/{}", app.repos.list.filter_text));
         frame.render_widget(filter_line, chunks[0]);
         idx = 1;
     }
 
     let items: Vec<ListItem> = app
         .repos
+        .list
         .filtered
         .iter()
         .map(|&i| {
-            let row = app.repos.rows[i];
+            let row = app.repos.list.rows[i];
             match row {
-                RepoRow::AllPackages => ListItem::new(Span::styled(
-                    "All packages",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
                 RepoRow::NoRepo => {
                     let n = app.data.orphan_names.len();
                     ListItem::new(Line::from(vec![
@@ -78,16 +125,25 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 RepoRow::Repo(r) => {
                     let repo = &app.data.repos[r];
                     let enabled_marker = if repo.enabled {
-                        Span::styled("\u{25cf}", Style::default().fg(Color::Green))
+                        Span::styled("\u{25cf}", Style::default().fg(app.theme.ok))
                     } else {
-                        Span::styled("\u{25cb}", Style::default().fg(Color::DarkGray))
+                        Span::styled("\u{25cb}", Style::default().fg(app.theme.dim))
                     };
                     let mut spans = vec![enabled_marker, Span::raw(" "), Span::raw(repo.title())];
                     if app.data.mapping_available() && repo.enabled && !app.data.repo_has_files(r) {
                         spans.push(Span::styled(
                             "  [never fetched]",
-                            Style::default().fg(Color::Yellow),
+                            Style::default().fg(app.theme.warn),
                         ));
+                    }
+                    if let Some(sev) = app.diagnostics.for_repo(r).map(|d| d.severity).max() {
+                        let (icon, color) = match sev {
+                            Severity::Error => ("\u{2717}", app.theme.error),
+                            Severity::Warning => ("\u{26a0}", app.theme.warn),
+                            Severity::Info => ("\u{2139}", app.theme.info),
+                        };
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(icon, Style::default().fg(color)));
                     }
                     ListItem::new(Line::from(spans))
                 }
@@ -96,20 +152,29 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let mut state = ListState::default();
-    if !app.repos.filtered.is_empty() {
-        state.select(Some(app.repos.selected));
+    if !app.repos.list.filtered.is_empty() {
+        state.select(Some(app.repos.list.selected));
     }
 
+    let border_color = if app.repos.focus == ReposFocus::Repos {
+        app.theme.accent
+    } else {
+        app.theme.dim
+    };
     let block = Block::default()
         .title(format!(
             "Repositories ({} configured)",
             app.data.repos.len()
         ))
-        .borders(Borders::ALL);
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(chunks[idx]);
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, chunks[idx], &mut state);
+    app.layout.repo_rows = inner;
+    app.layout.repo_row_offset = state.offset();
 }
 
 pub fn handle_key<B: Backend + std::io::Write>(
@@ -117,20 +182,28 @@ pub fn handle_key<B: Backend + std::io::Write>(
     key: KeyEvent,
     terminal: &mut Terminal<B>,
 ) -> anyhow::Result<()> {
-    if app.repos.filter_active {
+    if app.repos.mode == ReposMode::Drill {
+        if key.code == KeyCode::Esc {
+            app.close_drill();
+            return Ok(());
+        }
+        return super::packages::handle_key(app, key, terminal);
+    }
+
+    if app.repos.list.filter_active {
         match key.code {
             KeyCode::Esc => {
-                app.repos.filter_active = false;
+                app.repos.list.filter_active = false;
             }
             KeyCode::Enter => {
-                app.repos.filter_active = false;
+                app.repos.list.filter_active = false;
             }
             KeyCode::Backspace => {
-                app.repos.filter_text.pop();
+                app.repos.list.filter_text.pop();
                 app.refresh_repo_filter();
             }
             KeyCode::Char(c) => {
-                app.repos.filter_text.push(c);
+                app.repos.list.filter_text.push(c);
                 app.refresh_repo_filter();
             }
             _ => {}
@@ -140,19 +213,15 @@ pub fn handle_key<B: Backend + std::io::Write>(
 
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.repos.selected = app.repos.selected.saturating_sub(1);
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if app.repos.selected + 1 < app.repos.filtered.len() {
-                app.repos.selected += 1;
-            }
-        }
+        KeyCode::Left | KeyCode::Char('h') => app.repos.focus = ReposFocus::Repos,
+        KeyCode::Right | KeyCode::Char('l') => app.repos.focus = ReposFocus::Diagnostics,
+        KeyCode::Up | KeyCode::Char('k') => move_up(app),
+        KeyCode::Down | KeyCode::Char('j') => move_down(app),
         KeyCode::Char('/') => {
-            app.repos.filter_active = true;
+            app.repos.list.filter_active = true;
         }
-        KeyCode::Enter => open_selected(app),
-        KeyCode::Char(' ') => toggle_selected(app),
+        KeyCode::Enter if app.repos.focus == ReposFocus::Repos => open_selected(app),
+        KeyCode::Char(' ') if app.repos.focus == ReposFocus::Repos => toggle_selected(app),
         KeyCode::Char('a') => {
             app.prompt = Some((
                 Prompt {
@@ -164,37 +233,55 @@ pub fn handle_key<B: Backend + std::io::Write>(
         }
         KeyCode::Char('x') => remove_selected(app),
         KeyCode::Char('e') => edit_selected(app, terminal)?,
-        KeyCode::Char('u') => {
-            app.confirm = Some(PendingConfirm {
-                ui: Confirm {
-                    title: "apt update".into(),
-                    detail: vec![
-                        "This refreshes every repository's package index and requires sudo.".into(),
-                    ],
-                    prompt: "Run `apt update` now?".into(),
-                },
-                action: PendingAction::RunUpdate,
-            });
-        }
-        KeyCode::Char('h') => {
-            let repo_idx = selected_repo_idx(app);
-            app.open_health_for(repo_idx);
-        }
         KeyCode::Char('m') => migrate_selected(app),
-        KeyCode::Char('i') => show_removal_impact(app),
+        KeyCode::Char('d') => show_removal_impact(app),
+        KeyCode::Char('f') => queue_selected_fix(app),
+        KeyCode::Char('A') => apply_all_safe_for_selected(app, terminal)?,
         _ => {}
     }
     Ok(())
 }
 
-fn selected_row(app: &App) -> Option<RepoRow> {
-    app.repos
-        .filtered
-        .get(app.repos.selected)
-        .map(|&i| app.repos.rows[i])
+fn move_up(app: &mut App) {
+    match app.repos.focus {
+        ReposFocus::Repos => {
+            app.repos.list.selected = app.repos.list.selected.saturating_sub(1);
+            app.repos.diag_selected = 0;
+        }
+        ReposFocus::Diagnostics => {
+            app.repos.diag_selected = app.repos.diag_selected.saturating_sub(1);
+        }
+    }
 }
 
-fn selected_repo_idx(app: &App) -> Option<usize> {
+fn move_down(app: &mut App) {
+    match app.repos.focus {
+        ReposFocus::Repos => {
+            if app.repos.list.selected + 1 < app.repos.list.filtered.len() {
+                app.repos.list.selected += 1;
+            }
+            app.repos.diag_selected = 0;
+        }
+        ReposFocus::Diagnostics => {
+            let count = selected_repo_idx(app)
+                .map(|i| app.diagnostics.for_repo(i).count())
+                .unwrap_or(0);
+            if app.repos.diag_selected + 1 < count {
+                app.repos.diag_selected += 1;
+            }
+        }
+    }
+}
+
+fn selected_row(app: &App) -> Option<RepoRow> {
+    app.repos
+        .list
+        .filtered
+        .get(app.repos.list.selected)
+        .map(|&i| app.repos.list.rows[i])
+}
+
+pub(super) fn selected_repo_idx(app: &App) -> Option<usize> {
     match selected_row(app)? {
         RepoRow::Repo(idx) => Some(idx),
         _ => None,
@@ -203,16 +290,15 @@ fn selected_repo_idx(app: &App) -> Option<usize> {
 
 fn open_selected(app: &mut App) {
     match selected_row(app) {
-        Some(RepoRow::AllPackages) => app.open_packages_for(PackageContext::AllPackages),
-        Some(RepoRow::NoRepo) => app.open_packages_for(PackageContext::NoRepo),
-        Some(RepoRow::Repo(idx)) => app.open_packages_for(PackageContext::Repo(idx)),
+        Some(RepoRow::NoRepo) => app.open_drill(PackageContext::NoRepo),
+        Some(RepoRow::Repo(idx)) => app.open_drill(PackageContext::Repo(idx)),
         None => {}
     }
 }
 
 fn toggle_selected(app: &mut App) {
     let Some(idx) = selected_repo_idx(app) else {
-        app.set_status("Select a repository to toggle (not \"All packages\")", true);
+        app.set_status("Select a repository to toggle (not \"Not from any repository\")", true);
         return;
     };
     let repo = &app.data.repos[idx];
@@ -222,9 +308,52 @@ fn toggle_selected(app: &mut App) {
             title: "Toggle repository".into(),
             detail: vec![repo.title()],
             prompt: format!("{verb} this repository?"),
+            alt: None,
         },
         action: PendingAction::ToggleRepoEnabled(idx),
+        alt_action: None,
     });
+}
+
+/// Queue the global `u` (apt update) confirmation. Called from the global
+/// key handler in `app.rs` — `u` works from any tab, not just this one.
+pub fn queue_update(app: &mut App) {
+    app.confirm = Some(PendingConfirm {
+        ui: Confirm {
+            title: "apt update".into(),
+            detail: vec![
+                "This refreshes every repository's package index and requires sudo.".into(),
+            ],
+            prompt: "Run `apt update` now?".into(),
+            alt: None,
+        },
+        action: PendingAction::RunUpdate,
+        alt_action: None,
+    });
+}
+
+fn queue_selected_fix(app: &mut App) {
+    let Some(idx) = selected_repo_idx(app) else {
+        app.set_status("Select a repository first", true);
+        return;
+    };
+    let Some(d) = app.diagnostics.for_repo(idx).nth(app.repos.diag_selected).cloned() else {
+        app.set_status("No diagnosis selected", true);
+        return;
+    };
+    super::health::queue_fix(app, &d);
+}
+
+fn apply_all_safe_for_selected<B: Backend + std::io::Write>(
+    app: &mut App,
+    terminal: &mut Terminal<B>,
+) -> anyhow::Result<()> {
+    let Some(idx) = selected_repo_idx(app) else {
+        app.set_status("Select a repository first", true);
+        return Ok(());
+    };
+    let diags: Vec<Diagnosis> = app.diagnostics.for_repo(idx).cloned().collect();
+    super::health::apply_all_safe(app, &diags, terminal)
 }
 
 /// Actually flip the `enabled` state of every source entry backing a repo,
@@ -423,8 +552,10 @@ fn remove_selected(app: &mut App) {
             title: "Remove repository".into(),
             detail,
             prompt: "Remove this repository's source entry? (packages already installed are not removed)".into(),
+            alt: None,
         },
         action: PendingAction::ApplyFix(Fix::RemoveEntry { entry_id: repo.entry_ids[0] }),
+        alt_action: None,
     });
 }
 
@@ -489,11 +620,13 @@ fn migrate_selected(app: &mut App) {
             title: "Migrate to deb822".into(),
             detail: deb822_text.lines().map(|s| s.to_string()).collect(),
             prompt: "Rewrite this entry in the modern .sources format?".into(),
+            alt: None,
         },
         action: PendingAction::MigrateEntry {
             entry_id,
             new_text: deb822_text,
         },
+        alt_action: None,
     });
 }
 

@@ -17,6 +17,11 @@ pub struct InstalledPackage {
     pub version: String,
     pub architecture: String,
     pub state: InstallState,
+    /// `hold` in the `Status:` line's want-field — orthogonal to `state`
+    /// (`hold ok config-files` is a real, legal combination), so this is not
+    /// folded into `InstallState`.
+    pub held: bool,
+    pub essential: bool,
     pub source: Option<String>, // `Source:` field, when it differs from the binary name
     pub fields: Vec<(String, String)>,
 }
@@ -37,6 +42,10 @@ impl DpkgStatus {
 
     pub fn is_auto(&self, name: &str) -> bool {
         self.auto_installed.get(name).copied().unwrap_or(false)
+    }
+
+    pub fn is_held(&self, name: &str) -> bool {
+        self.packages.get(name).is_some_and(|p| p.held)
     }
 }
 
@@ -122,28 +131,36 @@ fn parse_status_stanza(stanza: &str) -> Option<InstalledPackage> {
         s.split_whitespace().next().unwrap_or(s).to_string()
     });
 
-    let state = match get("Status") {
+    let (state, held) = match get("Status") {
         Some(status_line) => classify_status(status_line),
-        None => InstallState::NotInstalled,
+        None => (InstallState::NotInstalled, false),
     };
+    let essential = get("Essential").is_some_and(|v| v == "yes");
 
     Some(InstalledPackage {
         name,
         version,
         architecture,
         state,
+        held,
+        essential,
         source,
         fields,
     })
 }
 
 /// `Status:` has three space-separated words: want, flag, status — e.g.
-/// `install ok installed`, `deinstall ok config-files`, `install reinstreq half-installed`.
-fn classify_status(status_line: &str) -> InstallState {
+/// `install ok installed`, `hold ok installed`, `deinstall ok config-files`,
+/// `install reinstreq half-installed`. `want` (`parts[0]`) is where `hold`
+/// lives — it is dpkg's selection state, independent of what's actually
+/// installed, so a held package can be in any install state.
+fn classify_status(status_line: &str) -> (InstallState, bool) {
     let parts: Vec<&str> = status_line.split_whitespace().collect();
-    let status = parts.get(2).copied().unwrap_or("");
+    let want = parts.first().copied().unwrap_or("");
     let flag = parts.get(1).copied().unwrap_or("");
-    match status {
+    let status = parts.get(2).copied().unwrap_or("");
+    let held = want == "hold";
+    let state = match status {
         "installed" => {
             if flag == "ok" {
                 InstallState::Installed
@@ -156,7 +173,8 @@ fn classify_status(status_line: &str) -> InstallState {
         "half-installed" | "unpacked" | "half-configured" | "triggers-awaited"
         | "triggers-pending" => InstallState::Broken,
         _ => InstallState::NotInstalled,
-    }
+    };
+    (state, held)
 }
 
 #[cfg(test)]
@@ -249,5 +267,58 @@ mod tests {
         assert_eq!(db.packages.len(), 2);
         assert!(db.is_installed("a"));
         assert!(db.is_installed("b"));
+    }
+
+    #[test]
+    fn classify_status_reads_the_want_field_for_hold() {
+        assert_eq!(
+            classify_status("hold ok installed"),
+            (InstallState::Installed, true)
+        );
+        assert_eq!(
+            classify_status("install ok installed"),
+            (InstallState::Installed, false)
+        );
+        assert_eq!(
+            classify_status("hold ok config-files"),
+            (InstallState::ConfigFiles, true)
+        );
+        assert_eq!(
+            classify_status("deinstall ok config-files"),
+            (InstallState::ConfigFiles, false)
+        );
+        assert_eq!(
+            classify_status("bogus"),
+            (InstallState::NotInstalled, false)
+        );
+    }
+
+    #[test]
+    fn held_package_is_queryable_via_is_held() {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir,
+            "dpkg/status",
+            "Package: vim\nStatus: hold ok installed\nVersion: 2:9.1-1\n\n\
+             Package: git\nStatus: install ok installed\nVersion: 1:2.43-1\n",
+        );
+        let db = load(dir.path()).unwrap();
+        assert!(db.is_held("vim"));
+        assert!(!db.is_held("git"));
+        assert!(!db.is_held("nonexistent"));
+    }
+
+    #[test]
+    fn essential_field_is_parsed() {
+        let dir = TempDir::new().unwrap();
+        write(
+            &dir,
+            "dpkg/status",
+            "Package: dpkg\nStatus: install ok installed\nEssential: yes\nVersion: 1\n\n\
+             Package: vim\nStatus: install ok installed\nVersion: 1\n",
+        );
+        let db = load(dir.path()).unwrap();
+        assert!(db.packages.get("dpkg").unwrap().essential);
+        assert!(!db.packages.get("vim").unwrap().essential);
     }
 }

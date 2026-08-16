@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -48,10 +49,21 @@ pub struct StanzaRef {
 }
 
 /// Name + version extracted eagerly for every stanza, plus a handle back to it.
+///
+/// The three extra flags are harvested during the same scan rather than from
+/// the full stanza, because every one of them is needed for *filtering and
+/// sorting the whole list* — i.e. on the per-keystroke path, where a lazy
+/// `full_stanza` call per row would be far too slow.
 #[derive(Debug, Clone)]
 pub struct PackageStub {
     pub name: String,
     pub version: String,
+    /// `Essential: yes` — packages APT refuses to remove without `--force`.
+    pub essential: bool,
+    /// `Phased-Update-Percentage`, when present and below 100. APT rolls an
+    /// upgrade out to this percentage of machines before the rest, which is
+    /// one of the reasons a package can show up as "kept back".
+    pub phased_pct: Option<u8>,
     pub stanza: StanzaRef,
 }
 
@@ -59,6 +71,14 @@ pub struct PackageStub {
 pub struct ListIndex {
     pub files: Vec<ListFile>,
     pub stubs: Vec<PackageStub>,
+    /// Parallel to `files`: the slice of `stubs` that came from each file.
+    ///
+    /// Stubs are stored flat but are appended one whole file at a time, so a
+    /// file's stubs are contiguous. Recording the ranges here turns
+    /// "which stubs belong to this file?" from a scan of every stub into a
+    /// slice index. `ranges_cover_stubs_exactly` enforces the contiguity this
+    /// relies on rather than leaving it as an assumption.
+    pub file_stub_ranges: Vec<Range<usize>>,
 }
 
 impl ListIndex {
@@ -91,9 +111,28 @@ impl ListIndex {
             .map(|(file_id, f)| index_stanzas(file_id, f.bytes()))
             .collect();
 
-        let stubs = per_file.into_iter().flatten().collect();
+        // Flatten in file order, recording each file's contiguous slice.
+        let mut stubs: Vec<PackageStub> = Vec::new();
+        let mut file_stub_ranges: Vec<Range<usize>> = Vec::with_capacity(files.len());
+        for chunk in per_file {
+            let start = stubs.len();
+            stubs.extend(chunk);
+            file_stub_ranges.push(start..stubs.len());
+        }
 
-        Ok(Self { files, stubs })
+        Ok(Self {
+            files,
+            stubs,
+            file_stub_ranges,
+        })
+    }
+
+    /// The stubs indexed from one file, as indices into `stubs`.
+    pub fn stub_range(&self, file_idx: usize) -> Range<usize> {
+        self.file_stub_ranges
+            .get(file_idx)
+            .cloned()
+            .unwrap_or(0..0)
     }
 
     /// Re-parse the full RFC822 stanza for a given reference into an ordered
@@ -140,6 +179,8 @@ fn index_stanzas(file_id: usize, bytes: &[u8]) -> Vec<PackageStub> {
         out.push(PackageStub {
             name,
             version,
+            essential: false,
+            phased_pct: None,
             stanza: StanzaRef {
                 file_id,
                 start,
@@ -147,7 +188,43 @@ fn index_stanzas(file_id: usize, bytes: &[u8]) -> Vec<PackageStub> {
             },
         });
     }
+
+    // `Essential: yes` and `Phased-Update-Percentage:` occur on the order of
+    // tens of times per file, versus tens of thousands of stanzas — so rather
+    // than looking for them inside every stanza, find the few occurrences in
+    // the whole file and binary-search back to the stanza that owns each one.
+    //
+    // Anchoring on a leading `\n` is what makes this safe: RFC822 continuation
+    // lines must begin with whitespace, so a match at column 0 is always a real
+    // field and never body text inside a `Description`.
+    for hit in memchr::memmem::find_iter(bytes, b"\nEssential: yes") {
+        if let Some(owner) = owning_stanza(&starts, hit) {
+            out[owner].essential = true;
+        }
+    }
+    const PHASED: &[u8] = b"\nPhased-Update-Percentage:";
+    for hit in memchr::memmem::find_iter(bytes, PHASED) {
+        let Some(owner) = owning_stanza(&starts, hit) else {
+            continue;
+        };
+        let value_start = hit + PHASED.len();
+        let value_end = memchr::memchr(b'\n', &bytes[value_start..])
+            .map(|o| value_start + o)
+            .unwrap_or(bytes.len());
+        out[owner].phased_pct = std::str::from_utf8(&bytes[value_start..value_end])
+            .ok()
+            .and_then(|s| s.trim().parse::<u8>().ok())
+            // 100% is fully rolled out, i.e. not phased at all.
+            .filter(|&p| p < 100);
+    }
+
     out
+}
+
+/// Index into `starts` of the stanza containing byte offset `hit`, i.e. the
+/// last start at or before it.
+fn owning_stanza(starts: &[usize], hit: usize) -> Option<usize> {
+    starts.partition_point(|&s| s <= hit).checked_sub(1)
 }
 
 /// Find the value of a `\nField: ` line within a stanza slice (the needle
@@ -257,6 +334,82 @@ Description: Another package\n\
         let idx = ListIndex::load(dir.path()).unwrap();
         assert_eq!(idx.stubs.len(), 1);
         assert_eq!(idx.stubs[0].name, "solo");
+    }
+
+    #[test]
+    fn essential_flag_attributed_to_middle_stanza() {
+        let dir = TempDir::new().unwrap();
+        write_packages(
+            &dir,
+            "test_Packages",
+            "Package: a\nVersion: 1\n\n\
+             Package: b\nVersion: 1\nEssential: yes\n\n\
+             Package: c\nVersion: 1\n\n",
+        );
+        let idx = ListIndex::load(dir.path()).unwrap();
+        assert!(!idx.stubs[0].essential, "a");
+        assert!(idx.stubs[1].essential, "b");
+        assert!(!idx.stubs[2].essential, "c");
+    }
+
+    #[test]
+    fn essential_text_in_description_body_is_not_a_false_positive() {
+        let dir = TempDir::new().unwrap();
+        write_packages(
+            &dir,
+            "test_Packages",
+            "Package: a\nVersion: 1\nDescription: mentions\n\x20Essential: yes in prose\n\n",
+        );
+        let idx = ListIndex::load(dir.path()).unwrap();
+        assert!(
+            !idx.stubs[0].essential,
+            "a continuation line is not a field, even if it starts with the field's text"
+        );
+    }
+
+    #[test]
+    fn phased_update_percentage_parsed_and_bounded() {
+        let dir = TempDir::new().unwrap();
+        write_packages(
+            &dir,
+            "test_Packages",
+            "Package: a\nVersion: 1\nPhased-Update-Percentage: 40\n\n\
+             Package: b\nVersion: 1\n\n\
+             Package: c\nVersion: 1\nPhased-Update-Percentage: 100\n\n",
+        );
+        let idx = ListIndex::load(dir.path()).unwrap();
+        assert_eq!(idx.stubs[0].phased_pct, Some(40));
+        assert_eq!(idx.stubs[1].phased_pct, None);
+        assert_eq!(
+            idx.stubs[2].phased_pct, None,
+            "100% rolled out is not phased"
+        );
+    }
+
+    #[test]
+    fn file_stub_ranges_cover_stubs_exactly_per_file() {
+        let dir = TempDir::new().unwrap();
+        write_packages(&dir, "a_Packages", "Package: a1\nVersion: 1\n\n");
+        write_packages(
+            &dir,
+            "b_Packages",
+            "Package: b1\nVersion: 1\n\nPackage: b2\nVersion: 1\n\n",
+        );
+        let idx = ListIndex::load(dir.path()).unwrap();
+        assert_eq!(idx.files.len(), 2);
+        assert_eq!(idx.file_stub_ranges.len(), 2);
+
+        // Ranges partition `stubs` with no gaps or overlaps, in file order.
+        let mut expect_start = 0usize;
+        for (file_idx, range) in idx.file_stub_ranges.iter().enumerate() {
+            assert_eq!(range.start, expect_start);
+            assert_eq!(idx.stub_range(file_idx), *range);
+            for i in range.clone() {
+                assert_eq!(idx.stubs[i].stanza.file_id, file_idx);
+            }
+            expect_start = range.end;
+        }
+        assert_eq!(expect_start, idx.stubs.len());
     }
 }
 

@@ -3,7 +3,7 @@ name = "aptnav"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "A repository-centric TUI for browsing and managing APT repositories and their packages"
+description = "A full-featured TUI for managing APT packages, with repository health diagnostics built in"
 authors = ["Eren Seymen"]
 license = "MIT"
 readme = "README.md"
@@ -20,6 +20,7 @@ rayon = "1.10"
 nucleo-matcher = "0.3"
 anyhow = "1.0"
 dirs = "5.0"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.10"
